@@ -1,0 +1,116 @@
+#!/usr/bin/env node
+// Two-way merge of providerConnections between ~/.9router/db/data.sqlite
+// and Supabase. Last-write-wins per row by updatedAt.
+//
+//   --dry-run   print plan, make no changes
+//   --init      print setup SQL + config template and exit
+//
+// Nothing is deleted: rows absent on one side are copied over, not pruned.
+
+import {
+  loadConfig,
+  openDb,
+  getDeviceId,
+  supaRequest,
+  rowToRemote,
+  remoteToRow,
+  ts,
+  label,
+  parseArgs,
+  SETUP_SQL,
+  CONFIG_PATH,
+  CONFIG_TEMPLATE,
+} from '../lib/sync-lib.mjs';
+
+const args = parseArgs(process.argv);
+if (args.help) {
+  console.log(
+    'usage: 9router-sync [--dry-run] [--init]\n' +
+      '  two-way merge of providerConnections with Supabase.\n' +
+      '  newer updatedAt wins. restart 9router after a pull to pick up changes.',
+  );
+  process.exit(0);
+}
+if (args.init) {
+  console.log(`# config: ${CONFIG_PATH}\n${CONFIG_TEMPLATE}`);
+  console.log(`\n# Supabase schema:\n${SETUP_SQL}`);
+  process.exit(0);
+}
+
+const cfg = loadConfig();
+const db = openDb(false);
+try {
+  const deviceId = getDeviceId(db);
+  const localRows = db.prepare('SELECT * FROM providerConnections').all();
+  const localMap = new Map(localRows.map((r) => [r.id, r]));
+  const remoteRows = await supaRequest(cfg, 'GET', `${cfg.table}?select=*`);
+  const remoteMap = new Map(remoteRows.map((r) => [r.id, r]));
+
+  const toPush = []; // local -> remote
+  const toPull = []; // remote -> local (as sqlite rows)
+  const ids = new Set([...localMap.keys(), ...remoteMap.keys()]);
+
+  for (const id of ids) {
+    const l = localMap.get(id);
+    const r = remoteMap.get(id);
+    if (l && !r) {
+      toPush.push(rowToRemote(l, deviceId));
+      continue;
+    }
+    if (r && !l) {
+      toPull.push(remoteToRow(r));
+      continue;
+    }
+    const lt = ts(l.updatedAt);
+    const rt = ts(r.updated_at);
+    if (lt > rt) toPush.push(rowToRemote(l, deviceId));
+    else if (rt > lt) toPull.push(remoteToRow(r));
+  }
+
+  if (toPush.length === 0 && toPull.length === 0) {
+    console.log('sync: already in sync');
+  } else {
+    if (toPush.length) {
+      console.log(`push ${toPush.length} -> supabase`);
+      for (const r of toPush)
+        console.log(`  \u2191 ${label(r.provider, r.name, r.id)}`);
+    }
+    if (toPull.length) {
+      console.log(`pull ${toPull.length} <- supabase`);
+      for (const r of toPull)
+        console.log(`  \u2193 ${label(r.provider, r.name, r.id)}`);
+    }
+
+    if (args.dryRun) {
+      console.log('(dry-run, no changes applied)');
+    } else {
+      if (toPush.length) await supaRequest(cfg, 'POST', cfg.table, toPush);
+
+      if (toPull.length) {
+        const upsert = db.prepare(`
+          INSERT INTO providerConnections
+            (id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt)
+          VALUES
+            (@id, @provider, @authType, @name, @email, @priority, @isActive, @data, @createdAt, @updatedAt)
+          ON CONFLICT(id) DO UPDATE SET
+            provider  = excluded.provider,
+            authType  = excluded.authType,
+            name      = excluded.name,
+            email     = excluded.email,
+            priority  = excluded.priority,
+            isActive  = excluded.isActive,
+            data      = excluded.data,
+            createdAt = excluded.createdAt,
+            updatedAt = excluded.updatedAt
+        `);
+        const tx = db.transaction(() => {
+          for (const r of toPull) upsert.run(r);
+        });
+        tx();
+        console.log('\nrestart 9router to pick up pulled changes.');
+      }
+    }
+  }
+} finally {
+  db.close();
+}

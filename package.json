@@ -1,0 +1,29 @@
+{
+  "name": "9router-sync",
+  "version": "0.1.0",
+  "description": "Two-way sync of 9router providerConnections with Supabase, so multiple devices can share the same accounts.",
+  "type": "module",
+  "bin": {
+    "9router-sync": "bin/9router-sync"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.0.0"
+  },
+  "keywords": [
+    "9router",
+    "supabase",
+    "sync",
+    "sqlite",
+    "cli"
+  ],
+  "license": "MIT"
+}
